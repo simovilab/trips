@@ -1,0 +1,90 @@
+name: ${COMPOSE_PROJECT_NAME:-trips}
+
+x-otp-common: &otp-common
+  image: ${OTP_IMAGE:-opentripplanner/opentripplanner:2.10.0}
+  user: "${OTP_UID:-1000}:${OTP_GID:-1000}"
+  init: true
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=512m,mode=1777
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  otp-build:
+    <<: *otp-common
+    profiles: ["build"]
+    entrypoint: ["bash", "/opt/otp/build.sh"]
+    command: ["--build", "--save"]
+    environment:
+      JAVA_TOOL_OPTIONS: ${OTP_BUILD_JAVA_OPTIONS:--Xmx8g -XX:+ExitOnOutOfMemoryError}
+    mem_limit: ${OTP_BUILD_MEMORY_LIMIT:-12g}
+    cpus: ${OTP_BUILD_CPUS:-4}
+    network_mode: none
+    volumes:
+      - ${OTP_DATA_DIR:-./data}:/var/opentripplanner
+      - ./config/otp-config.json:/opt/otp/otp-config.json:ro
+      - ./scripts/build.sh:/opt/otp/build.sh:ro
+    labels:
+      traefik.enable: "false"
+
+  otp:
+    <<: *otp-common
+    command: ["--load", "--serve"]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      JAVA_TOOL_OPTIONS: ${OTP_JAVA_OPTIONS:--Xmx4g -XX:+ExitOnOutOfMemoryError}
+    mem_limit: ${OTP_MEMORY_LIMIT:-6g}
+    cpus: ${OTP_CPUS:-2}
+    volumes:
+      - type: bind
+        source: ${OTP_DATA_DIR:-./data}/graph.obj
+        target: /var/opentripplanner/graph.obj
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./config/otp-config.json:/var/opentripplanner/otp-config.json:ro
+      - ./scripts/healthcheck.sh:/opt/otp/healthcheck.sh:ro
+    networks:
+      - traefik_proxy
+    healthcheck:
+      test: ["CMD", "bash", "/opt/otp/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: ${OTP_HEALTH_START_PERIOD:-180s}
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-traefik_proxy}
+      traefik.http.services.trips-otp.loadbalancer.server.port: "8080"
+      traefik.http.routers.trips-otp.rule: Host(`${OTP_HOST:-trips.simovi.org}`)
+      traefik.http.routers.trips-otp.entrypoints: ${TRAEFIK_HTTPS_ENTRYPOINT:-websecure}
+      traefik.http.routers.trips-otp.tls: "true"
+      traefik.http.routers.trips-otp.tls.certresolver: ${TRAEFIK_CERT_RESOLVER-letsencrypt}
+      traefik.http.routers.trips-otp.service: trips-otp
+      traefik.http.routers.trips-otp.middlewares: trips-otp-auth,trips-otp-headers
+      traefik.http.middlewares.trips-otp-auth.basicauth.users: ${OTP_AUTH_USERS:?Set OTP_AUTH_USERS to a bcrypt htpasswd entry in .env}
+      traefik.http.middlewares.trips-otp-auth.basicauth.removeheader: "true"
+      traefik.http.middlewares.trips-otp-auth.basicauth.realm: OpenTripPlanner
+      traefik.http.middlewares.trips-otp-headers.headers.contenttypenosniff: "true"
+      traefik.http.middlewares.trips-otp-headers.headers.framedeny: "true"
+      traefik.http.middlewares.trips-otp-headers.headers.stsseconds: "31536000"
+      traefik.http.routers.trips-otp-http.rule: Host(`${OTP_HOST:-trips.simovi.org}`)
+      traefik.http.routers.trips-otp-http.entrypoints: ${TRAEFIK_HTTP_ENTRYPOINT:-web}
+      traefik.http.routers.trips-otp-http.middlewares: trips-otp-https
+      traefik.http.routers.trips-otp-http.service: noop@internal
+      traefik.http.middlewares.trips-otp-https.redirectscheme.scheme: https
+      traefik.http.middlewares.trips-otp-https.redirectscheme.permanent: "true"
+
+networks:
+  traefik_proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik_proxy}
